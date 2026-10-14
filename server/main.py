@@ -2566,11 +2566,19 @@ async def get_pcb_rules(ctx: Context) -> str:
 @mcp.tool()
 async def get_pcb_layer_stackup(ctx: Context) -> str:
     """
-    Get the detailed layer stackup information from the current Altium PCB including
-    copper thickness, dielectric materials, constants, and heights
-    
+    Get the physical layer stackup of the current Altium PCB, top to bottom.
+
+    Each solder mask, copper and dielectric layer is its own entry in
+    `layers`, in stack order, with layer_type (Copper / Dielectric /
+    Solder Mask) and thickness in mils, um and mm. Dielectric and solder
+    mask entries also carry dielectric_type (Core / PrePreg / Surface
+    Material / Solder Mask), material, dielectric_constant (Dk) and
+    loss_tangent (Df). Paste and overlay layers are omitted.
+
     Returns:
-        str: JSON object with detailed layer stackup information
+        str: JSON object with board_name, copper_layers, dielectric_layers,
+             solder_mask_layers, total_thickness_mils/_mm (including
+             solder mask), thickness_without_solder_mask_mm and layers
     """
     logger.info("Getting PCB layer stackup information")
     

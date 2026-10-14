@@ -698,17 +698,30 @@ begin
     end;
 end;
 
-// Function to get detailed layer stackup information
+// Function to get detailed layer stackup information.
+// Walks the V7 layer stack in physical order (top to bottom) so dielectric
+// and solder mask layers are reported as their own entries. The legacy
+// LayerObject.Dielectric property is not populated by Layer Stack Manager v2
+// and always reads eNoDielectric.
 function GetPCBLayerStackup(ROOT_DIR): String;
 var
     Board           : IPCB_Board;
+    TheLayerStack   : IPCB_LayerStack_V7;
     LayerIterator   : IPCB_LayerObjectIterator;
-    LayerObject     : IPCB_LayerObject;
+    LayerObj        : IPCB_LayerObject;
+    CopperLayerIDs  : TStringList;
     StackupArray    : TStringList;
     LayerProps      : TStringList;
     OutputLines     : TStringList;
+    LayerKind       : String;
+    DielectricName  : String;
+    ThicknessMils   : Double;
     TotalThickness  : Double;
-    LayerCount      : Integer;
+    MaskThickness   : Double;
+    CopperCount     : Integer;
+    DielectricCount : Integer;
+    MaskCount       : Integer;
+    LayerOrder      : Integer;
 begin
     Result := '';
 
@@ -720,83 +733,118 @@ begin
         Exit;
     end;
 
-    // Create arrays for stackup data
+    TheLayerStack := Board.LayerStack_V7;
+    if (TheLayerStack = nil) then
+    begin
+        Result := '{"error": "Could not access the PCB layer stack"}';
+        Exit;
+    end;
+
     StackupArray := TStringList.Create;
+    CopperLayerIDs := TStringList.Create;
     TotalThickness := 0;
-    LayerCount := 0;
-    
+    MaskThickness := 0;
+    CopperCount := 0;
+    DielectricCount := 0;
+    MaskCount := 0;
+    LayerOrder := 0;
+
     try
-        // Get the electrical layer iterator
+        // Copper layers (signal and plane) are the electrical layers
         LayerIterator := Board.ElectricalLayerIterator;
-        
-        // Process each electrical layer
         while LayerIterator.Next do
+            CopperLayerIDs.Add(IntToStr(LayerIterator.LayerObject.LayerID));
+
+        LayerObj := TheLayerStack.First(eLayerClass_All);
+        while (LayerObj <> nil) do
         begin
-            LayerObject := LayerIterator.LayerObject;
-            
-            // Create layer properties
-            LayerProps := TStringList.Create;
-            try
-                // Basic layer information
-                AddJSONProperty(LayerProps, 'layer_name', LayerObject.Name);
-                AddJSONProperty(LayerProps, 'layer_id', Layer2String(LayerObject.LayerID));
-                AddJSONProperty(LayerProps, 'material_type', 'Copper');
-                AddJSONNumber(LayerProps, 'copper_thickness_mils', LayerObject.CopperThickness / 10000);
-                AddJSONNumber(LayerProps, 'copper_thickness_um', LayerObject.CopperThickness / 254);
-                
-                // Add copper thickness to total
-                TotalThickness := TotalThickness + (LayerObject.CopperThickness / 10000);
-                
-                // Dielectric information (if present)
-                if LayerObject.Dielectric.DielectricType <> eNoDielectric then
-                begin
-                    case LayerObject.Dielectric.DielectricType of
-                        eCore: AddJSONProperty(LayerProps, 'dielectric_type', 'Core');
-                        ePrePreg: AddJSONProperty(LayerProps, 'dielectric_type', 'PrePreg');
-                        eSurfaceMaterial: AddJSONProperty(LayerProps, 'dielectric_type', 'Surface Material');
+            // Classify the layer; paste and overlay layers have no physical
+            // thickness in the stackup and are skipped
+            LayerKind := '';
+            if CopperLayerIDs.IndexOf(IntToStr(LayerObj.LayerID)) >= 0 then
+                LayerKind := 'Copper'
+            else if (LayerObj.LayerID = eTopSolder) or (LayerObj.LayerID = eBottomSolder) then
+                LayerKind := 'Solder Mask'
+            else if (LayerObj.LayerID = eNoLayer) then
+                LayerKind := 'Dielectric';
+
+            if (LayerKind <> '') then
+            begin
+                LayerProps := TStringList.Create;
+                try
+                    LayerOrder := LayerOrder + 1;
+                    AddJSONInteger(LayerProps, 'layer_order', LayerOrder);
+                    AddJSONProperty(LayerProps, 'layer_name', LayerObj.Name);
+                    AddJSONProperty(LayerProps, 'layer_type', LayerKind);
+                    AddJSONProperty(LayerProps, 'layer_id', Layer2String(LayerObj.LayerID));
+
+                    if (LayerKind = 'Copper') then
+                    begin
+                        ThicknessMils := LayerObj.CopperThickness / 10000;
+                        AddJSONProperty(LayerProps, 'material', 'Copper');
+                        CopperCount := CopperCount + 1;
+                    end
                     else
-                        AddJSONProperty(LayerProps, 'dielectric_type', 'Unknown');
+                    begin
+                        ThicknessMils := LayerObj.DielectricHeight / 10000;
+                        // Solder masks are identified by layer ID. The V7
+                        // dielectric type codes do not match the legacy
+                        // TDielectricType enum (a core reads as 0).
+                        if (LayerKind = 'Solder Mask') then
+                            DielectricName := 'Solder Mask'
+                        else
+                        begin
+                            case LayerObj.DielectricType of
+                                0: DielectricName := 'Core';
+                                1: DielectricName := 'PrePreg';
+                                2: DielectricName := 'Surface Material';
+                            else
+                                DielectricName := 'Unknown';
+                            end;
+                        end;
+                        AddJSONProperty(LayerProps, 'dielectric_type', DielectricName);
+                        AddJSONInteger(LayerProps, 'dielectric_type_code', LayerObj.DielectricType);
+                        AddJSONProperty(LayerProps, 'material', LayerObj.DielectricMaterial);
+                        AddJSONNumber(LayerProps, 'dielectric_constant', LayerObj.DielectricConstant);
+                        AddJSONNumber(LayerProps, 'loss_tangent', LayerObj.DielectricLossTangent);
+
+                        if (LayerKind = 'Solder Mask') then
+                        begin
+                            MaskCount := MaskCount + 1;
+                            MaskThickness := MaskThickness + ThicknessMils;
+                        end
+                        else
+                            DielectricCount := DielectricCount + 1;
                     end;
-                    
-                    AddJSONProperty(LayerProps, 'dielectric_material', LayerObject.Dielectric.DielectricMaterial);
-                    AddJSONNumber(LayerProps, 'dielectric_height_mils', LayerObject.Dielectric.DielectricHeight / 10000);
-                    AddJSONNumber(LayerProps, 'dielectric_height_um', LayerObject.Dielectric.DielectricHeight / 254);
-                    AddJSONNumber(LayerProps, 'dielectric_constant', LayerObject.Dielectric.DielectricConstant);
-                    
-                    // Add dielectric thickness to total
-                    TotalThickness := TotalThickness + (LayerObject.Dielectric.DielectricHeight / 10000);
-                end
-                else
-                begin
-                    AddJSONProperty(LayerProps, 'dielectric_type', 'No Dielectric');
-                    AddJSONProperty(LayerProps, 'dielectric_material', '');
-                    AddJSONNumber(LayerProps, 'dielectric_height_mils', 0);
-                    AddJSONNumber(LayerProps, 'dielectric_height_um', 0);
-                    AddJSONNumber(LayerProps, 'dielectric_constant', 0);
+
+                    AddJSONNumber(LayerProps, 'thickness_mils', ThicknessMils);
+                    AddJSONNumber(LayerProps, 'thickness_um', ThicknessMils * 25.4);
+                    AddJSONNumber(LayerProps, 'thickness_mm', ThicknessMils * 0.0254);
+                    TotalThickness := TotalThickness + ThicknessMils;
+
+                    StackupArray.Add(BuildJSONObject(LayerProps, 1));
+                finally
+                    LayerProps.Free;
                 end;
-                
-                // Add layer order
-                AddJSONInteger(LayerProps, 'layer_order', LayerCount + 1);
-                
-                // Add to stackup array
-                StackupArray.Add(BuildJSONObject(LayerProps, 1));
-                LayerCount := LayerCount + 1;
-            finally
-                LayerProps.Free;
             end;
+
+            LayerObj := TheLayerStack.Next(eLayerClass_All, LayerObj);
         end;
-        
+
         // Create final stackup object with summary
         LayerProps := TStringList.Create;
         try
-            AddJSONInteger(LayerProps, 'total_layers', LayerCount);
+            AddJSONProperty(LayerProps, 'board_name', ExtractFileName(Board.FileName));
+            AddJSONInteger(LayerProps, 'copper_layers', CopperCount);
+            AddJSONInteger(LayerProps, 'dielectric_layers', DielectricCount);
+            AddJSONInteger(LayerProps, 'solder_mask_layers', MaskCount);
             AddJSONNumber(LayerProps, 'total_thickness_mils', TotalThickness);
             AddJSONNumber(LayerProps, 'total_thickness_mm', TotalThickness * 0.0254);
-            AddJSONProperty(LayerProps, 'board_name', ExtractFileName(Board.FileName));
-            
+            AddJSONNumber(LayerProps, 'thickness_without_solder_mask_mm', (TotalThickness - MaskThickness) * 0.0254);
+
             // Add the layers array
             LayerProps.Add(BuildJSONArray(StackupArray, 'layers'));
-            
+
             // Build the final JSON
             OutputLines := TStringList.Create;
             try
@@ -809,6 +857,7 @@ begin
             LayerProps.Free;
         end;
     finally
+        CopperLayerIDs.Free;
         StackupArray.Free;
     end;
 end;
